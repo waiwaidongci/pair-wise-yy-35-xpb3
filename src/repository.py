@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -64,6 +65,26 @@ class Repository:
                     previous_hash TEXT NOT NULL,
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS withdrawal_applications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    app_number TEXT NOT NULL UNIQUE,
+                    close_version INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    supplementary_items TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','submitted','reviewed')),
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    close_snapshot TEXT NOT NULL,
+                    basis TEXT NOT NULL DEFAULT '{{}}',
+                    opened_record_ids TEXT NOT NULL DEFAULT '[]',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    submitted_by TEXT,
+                    submitted_at TEXT,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT
                 );
             """)
 
@@ -213,3 +234,196 @@ class Repository:
     def close(self) -> None:
         with self._lock:
             self.conn.close()
+
+    # ---- 撤回结案申请 ----
+
+    @staticmethod
+    def _withdrawal(row: sqlite3.Row) -> Dict[str, Any]:
+        result = dict(row)
+        for col in ("supplementary_items", "close_snapshot", "basis", "opened_record_ids"):
+            if result.get(col) is not None:
+                result[col] = json.loads(result[col])
+        return result
+
+    @staticmethod
+    def _basis_from_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "severity": snapshot["severity"],
+            "quantity": snapshot["quantity"],
+            "threshold": snapshot["threshold"],
+            "open_records": snapshot.get("open_records", 0),
+            "priority": snapshot["priority"],
+            "deadline_hours": snapshot["deadline_hours"],
+            "escalation_required": snapshot["escalation_required"],
+        }
+
+    def create_withdrawal(self, item_id: int, close_version: int, reason: str,
+                          supplementary_items: List[str], snapshot: Dict[str, Any],
+                          actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        placeholder = uuid.uuid4().hex
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO withdrawal_applications(item_id, app_number, close_version,
+                   reason, supplementary_items, status, revision, close_snapshot, basis,
+                   opened_record_ids, created_by, created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (item_id, placeholder, close_version, reason,
+                 json.dumps(supplementary_items, ensure_ascii=False), "pending", 1,
+                 json.dumps(snapshot, ensure_ascii=False),
+                 json.dumps(self._basis_from_snapshot(snapshot), ensure_ascii=False),
+                 "[]", actor, now),
+            )
+            app_id = int(cur.lastrowid)
+            app_number = f"WD-{app_id:06d}"
+            self.conn.execute(
+                "UPDATE withdrawal_applications SET app_number=? WHERE id=?",
+                (app_number, app_id),
+            )
+        return self.get_withdrawal(app_id)
+
+    def get_withdrawal(self, app_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM withdrawal_applications WHERE id=?", (app_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("撤回申请不存在")
+        return self._withdrawal(row)
+
+    def get_active_withdrawal(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM withdrawal_applications
+                   WHERE item_id=? AND status!='reviewed'
+                   ORDER BY id DESC LIMIT 1""",
+                (item_id,),
+            ).fetchone()
+        return self._withdrawal(row) if row else None
+
+    def list_withdrawals(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM withdrawal_applications WHERE item_id=? ORDER BY id DESC",
+                (item_id,),
+            ).fetchall()
+        return [self._withdrawal(row) for row in rows]
+
+    def submit_withdrawal(self, app_id: int, expected_revision: int,
+                          supplementary_items: List[str], actor: str
+                          ) -> tuple:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM withdrawal_applications WHERE id=?", (app_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("撤回申请不存在")
+            app = self._withdrawal(row)
+            if app["status"] != "pending":
+                raise ConflictError("撤回申请已提交", {"current_revision": app["revision"]})
+            if app["revision"] != expected_revision:
+                raise ConflictError("修订号冲突，请刷新后重试",
+                                    {"current_revision": app["revision"]})
+            cur = self.conn.execute(
+                "UPDATE items SET status='follow_up', version=version+1, updated_at=? WHERE id=?",
+                (now, app["item_id"]),
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError("项目不存在")
+            opened_ids: List[int] = []
+            for index, text in enumerate(supplementary_items):
+                cur = self.conn.execute(
+                    """INSERT INTO records(item_id, kind, detail, status, external_ref,
+                       created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
+                    (app["item_id"], "withdrawal_item", text, "open",
+                     f"{app['app_number']}-{index}", actor, now),
+                )
+                opened_ids.append(int(cur.lastrowid))
+            self.conn.execute(
+                """UPDATE withdrawal_applications SET status='submitted', revision=revision+1,
+                   opened_record_ids=?, submitted_by=?, submitted_at=?
+                   WHERE id=? AND revision=?""",
+                (json.dumps(opened_ids), actor, now, app_id, expected_revision),
+            )
+            item_row = self.conn.execute(
+                "SELECT * FROM items WHERE id=?", (app["item_id"],)
+            ).fetchone()
+            app_row = self.conn.execute(
+                "SELECT * FROM withdrawal_applications WHERE id=?", (app_id,)
+            ).fetchone()
+        return self._item(item_row), self._withdrawal(app_row), opened_ids
+
+    def restore_withdrawal(self, app_id: int, snapshot: Dict[str, Any],
+                           old_revision: int, actor: str) -> None:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM withdrawal_applications WHERE id=?", (app_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("撤回申请不存在")
+            app = self._withdrawal(row)
+            self.conn.execute(
+                "UPDATE items SET status='closed', version=?, updated_at=? WHERE id=?",
+                (snapshot["version"], now, app["item_id"]),
+            )
+            opened = app.get("opened_record_ids") or []
+            if opened:
+                placeholders = ",".join("?" for _ in opened)
+                self.conn.execute(
+                    f"DELETE FROM records WHERE id IN ({placeholders})", opened
+                )
+            self.conn.execute(
+                """UPDATE withdrawal_applications SET status='pending', revision=?,
+                   opened_record_ids='[]', submitted_by=NULL, submitted_at=NULL
+                   WHERE id=?""",
+                (old_revision, app_id),
+            )
+
+    def review_withdrawal(self, app_id: int, expected_revision: int,
+                          basis: Dict[str, Any], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM withdrawal_applications WHERE id=?", (app_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("撤回申请不存在")
+            app = self._withdrawal(row)
+            if app["status"] != "submitted":
+                raise ConflictError("撤回申请未提交", {"current_revision": app["revision"]})
+            if app["revision"] != expected_revision:
+                raise ConflictError("修订号冲突，请刷新后重试",
+                                    {"current_revision": app["revision"]})
+            self.conn.execute(
+                """UPDATE withdrawal_applications SET status='reviewed', revision=revision+1,
+                   basis=?, reviewed_by=?, reviewed_at=? WHERE id=? AND revision=?""",
+                (json.dumps(basis, ensure_ascii=False), actor, now,
+                 app_id, expected_revision),
+            )
+            app_row = self.conn.execute(
+                "SELECT * FROM withdrawal_applications WHERE id=?", (app_id,)
+            ).fetchone()
+        return self._withdrawal(app_row)
+
+    def correct_item_dose(self, item_id: int, quantity: float, threshold: float,
+                          expected_version: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE items SET quantity=?, threshold=?, version=version+1, updated_at=?
+                   WHERE id=? AND version=?""",
+                (quantity, threshold, now, item_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM items WHERE id=?", (item_id,)
+                ).fetchone()
+                if exists is None:
+                    raise NotFoundError("项目不存在")
+                raise ConflictError("版本冲突，请刷新后重试")
+            row = self.conn.execute(
+                "SELECT * FROM items WHERE id=?", (item_id,)
+            ).fetchone()
+        return self._item(row)

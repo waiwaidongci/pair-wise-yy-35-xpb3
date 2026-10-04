@@ -30,9 +30,17 @@ python3 app.py --db ./data.db --port 8312
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/items/{id}/withdrawal`，撤回结案申请（结案版本、撤回原因、拟补事项）
+- `GET /api/items/{id}/withdrawal`，撤回申请列表
+- `GET /api/items/{id}/withdrawal/{app_id}`，撤回申请详情（含原结案快照）
+- `POST /api/items/{id}/withdrawal/{app_id}/submit`，辐射防护员提交（修订号乐观锁，后到者收到`current_revision`）
+- `POST /api/items/{id}/withdrawal/{app_id}/review`，卫生物理师复核后更新依据（其他角色返回越权）
+- `POST /api/items/{id}/dose-correction`，剂量更正（随访中，重算优先级/期限/升级判断）
 - `GET /api/audit`
 
 允许角色：dosimetrist, radiation_officer, health_physicist, viewer。剂量与调查水平之比决定升级程度，超过阈值必须进入调查；更正剂量不能覆盖已确认审计记录。
+
+撤回结案为剂量事件下的受控复核：申请人填写结案版本、撤回原因和拟补事项后生成申请号并冻结原结案快照；辐射防护员提交后事件回到随访，拟补事项重开为未结事项，原结案快照可查。两人同时提交时先到者占用修订号，后到者收到当前版本。审计链写入失败则从结案快照恢复、沿用同一申请号重试，剂量事件保持结案。补录记录或剂量更正后当前依据变化，优先级、期限和升级判断即时重算，但须经卫生物理师复核后才更新依据，其他角色提交返回越权。
 
 ## 测试
 
