@@ -30,9 +30,20 @@ python3 app.py --db ./data.db --port 8312
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/items/{id}/withdrawals`，撤回结案申请（radiation_officer），提交`closure_version`、`reason`、`planned_items`、`expected_version`
+- `POST /api/items/{id}/withdrawals/{aid}/retry`，审计写入失败后沿用同一申请号重试
+- `POST /api/items/{id}/withdrawals/{aid}/review`，撤回复核（health_physicist），复核后更新当前依据
+- `POST /api/items/{id}/dose-corrections`，剂量更正（dosimetrist、health_physicist），结案事件需先撤回
+- `GET /api/items/{id}/withdrawals`
+- `GET /api/items/{id}/closure-snapshots`，原结案快照
+- `GET /api/items/{id}/basis`，依据修订历史（结案、剂量更正、撤回复核）
 - `GET /api/audit`
 
 允许角色：dosimetrist, radiation_officer, health_physicist, viewer。剂量与调查水平之比决定升级程度，超过阈值必须进入调查；更正剂量不能覆盖已确认审计记录。
+
+## 撤回结案
+
+结案时自动保存结案快照（结案版本、依据、已结事项清单）。radiation_officer提交撤回申请后事件回到`follow_up`，结案时已结事项重开，原结案快照仍可查询；申请携带按事件递增的修订号，并发提交时先到者占用修订号，后到者收到当前版本冲突。审计链写入失败时从结案快照恢复（事件保持结案、事项恢复已结），申请保留`pending`状态，可沿用同一申请号重试。补录记录或剂量更正后按当前数据重算优先级、期限与升级判断；health_physicist复核撤回申请后写入新的依据修订，其他角色提交复核返回越权。
 
 ## 测试
 

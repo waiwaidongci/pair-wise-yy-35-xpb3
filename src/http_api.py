@@ -89,6 +89,21 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/withdrawals"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"withdrawals": service.list_withdrawals(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/closure-snapshots"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"snapshots": service.list_closure_snapshots(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/basis"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"revisions": service.list_basis_revisions(item_id, role)})
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -119,6 +134,25 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif (path.startswith("/api/items/") and "/withdrawals/" in path
+                      and path.endswith("/review")):
+                    parts = path.split("/")
+                    item_id = int(parts[3]); application_id = int(parts[5])
+                    self._json(200, service.review_withdrawal(
+                        item_id, application_id, body, actor, role))
+                elif (path.startswith("/api/items/") and "/withdrawals/" in path
+                      and path.endswith("/retry")):
+                    parts = path.split("/")
+                    item_id = int(parts[3]); application_id = int(parts[5])
+                    self._json(200, service.retry_withdrawal(
+                        item_id, application_id, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/withdrawals"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.request_withdrawal(
+                        item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/dose-corrections"):
+                    item_id = int(path.split("/")[3])
+                    self._json(200, service.correct_dose(item_id, body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
